@@ -7,8 +7,8 @@ import React, { useEffect, useRef } from 'react';
 // ─────────────────────────────────────────────
 export type AetherHeroProps = {
   /* ---------- 히어로 콘텐츠 ---------- */
-  title?: string;
-  subtitle?: string;
+  title?: React.ReactNode;    // 문자열 또는 JSX 허용 (뱃지, 그라디언트 텍스트 등)
+  subtitle?: React.ReactNode; // 문자열 또는 JSX 허용
   ctaLabel?: string;
   ctaHref?: string;
   secondaryCtaLabel?: string;
@@ -28,6 +28,9 @@ export type AetherHeroProps = {
   height?: string | number;            // 높이 (기본값: '100vh')
   className?: string;
   ariaLabel?: string;
+
+  /* ---------- 확장 슬롯 ---------- */
+  children?: React.ReactNode;          // section 내부 추가 콘텐츠 (SVG 카드 등)
 };
 
 // ─────────────────────────────────────────────
@@ -105,6 +108,9 @@ export default function AetherHero({
   height = '100vh',
   className = '',
   ariaLabel = 'Aurora hero background',
+
+  /* 확장 슬롯 */
+  children,
 }: AetherHeroProps) {
   // ── WebGL 관련 ref ──
   const canvasRef   = useRef<HTMLCanvasElement | null>(null);
@@ -244,13 +250,14 @@ export default function AetherHero({
       style={{ height, position: 'relative', overflow: 'hidden' }}
       aria-label="Hero"
     >
+      {/* 외부에서 주입된 커스텀 슬롯 (절대 위치로 자유 배치 가능) */}
       {/*
-        Space Grotesk 폰트 로드
+        Indie Flower 폰트 로드 (Google Fonts)
         styled-jsx 대신 일반 <link> 태그 사용 (Next.js App Router 호환)
       */}
       <link
         rel="stylesheet"
-        href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&display=swap"
+        href="https://fonts.googleapis.com/css2?family=Indie+Flower&display=swap"
       />
 
       {/* WebGL 셰이더 캔버스 (배경) */}
@@ -292,7 +299,7 @@ export default function AetherHero({
           padding: 'min(6vw, 64px)',
           color: textColor,
           fontFamily:
-            "'Space Grotesk', ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, 'Helvetica Neue', Arial",
+            "'Indie Flower', cursive, ui-sans-serif, system-ui, sans-serif",
         }}
       >
         <div
@@ -390,6 +397,9 @@ export default function AetherHero({
           )}
         </div>
       </div>
+
+      {/* children: 썸네일 카드 등 추가 데코레이션 요소 */}
+      {children}
     </section>
   );
 }
