@@ -5,26 +5,37 @@
  *
  * NailArt-AI 로그인 사용자 대시보드 페이지
  * ─────────────────────────────────────────────────────────────
- * [요구사항 반영 내역]
- * 1. 배경: checkgrid가 아닌 깔끔한 단일 그리드 타일(Grid Tile) 패턴 (#181818)
- * 2. 상단 네비게이션: 새로 제작된 components/dashboard/DashboardNavbar 연동
- *    (투명 배경, 좌측 독립 로고 플로팅 버튼, 우측 사용자 프로필 팝오버)
- * 3. 중앙 PromptArea(PromptInputBox):
- *    - 대형 프롬프트 입력 영역 테두리에 BorderBeam(그린 네온 빔) 디자인 적용
- *    - duration={4}, size={300}, reverse, from-transparent via-green-500 to-transparent 반영
- * 4. 인증 보호: 비로그인 시 자동으로 /auth 로 안전하게 리디렉션
+ * [주요 기능]
+ * 1. 단일 그리드 타일 배경 디자인 (#181818)
+ * 2. 독립 알약 버튼 스타일의 DashboardNavbar 연동
+ * 3. 중앙 집중형 PromptArea(PromptInputBox) + 녹색 BorderBeam 디자인
+ * 4. 다중 참조 이미지(개당 5MB, 최대 10개) 및 프롬프트 기반 썸네일 생성 API 연동
+ * 5. 생성된 16:9 썸네일 즉시 미리보기 및 원클릭 다운로드
+ * 6. 하단 "내 썸네일 갤러리" 실시간 동기화
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { Sparkles, Wand2, Compass, Layers, Film } from 'lucide-react';
+import {
+  Sparkles,
+  Wand2,
+  Compass,
+  Layers,
+  Film,
+  Download,
+  ExternalLink,
+  Clock,
+  AlertCircle,
+  Copy,
+  Check,
+} from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
 import DashboardNavbar from '@/components/dashboard/DashboardNavbar';
 import { PromptInputBox } from '@/components/ui/ai-prompt-box';
 import { BorderBeam } from '@/components/ui/border-beam';
+import type { Thumbnail } from '@/types/thumbnail';
 
-// ── 1. 단일 그리드 타일 배경 스타일 ─────────────────────────────
-// 복잡한 체커보드 대신 현대적이고 심플한 격자선 그리드 타일로 구성합니다.
+// ── 단일 그리드 타일 배경 스타일 ─────────────────────────────
 const GRID_TILE_STYLE: React.CSSProperties = {
   backgroundColor: '#181818',
   backgroundImage: `
@@ -40,22 +51,26 @@ const QUICK_SUGGESTIONS = [
   {
     icon: Film,
     label: '일본 오사카 3박 4일 감성 브이로그 썸네일',
-    prompt: '일본 오사카 여행 3박 4일 감성 브이로그, 따뜻한 노을빛 색감, 맑고 청량한 거리 배경, 감각적인 한글 캘리그라피 타이틀',
+    prompt:
+      '일본 오사카 여행 3박 4일 감성 브이로그, 따뜻한 노을빛 색감, 맑고 청량한 거리 배경, 감각적인 한글 캘리그라피 타이틀, 16:9 유튜브 썸네일',
   },
   {
     icon: Wand2,
     label: '2026 AI 혁신 트렌드 완벽 정리',
-    prompt: '미래지향적인 네온 블루와 퍼플 사이버펑크 톤, 인공지능 로봇 손과 디지털 홀로그램, 압도적인 긴장감의 테크 유튜브 썸네일',
+    prompt:
+      '미래지향적인 네온 블루와 퍼플 사이버펑크 톤, 인공지능 로봇 손과 디지털 홀로그램, 압도적인 긴장감의 테크 유튜브 썸네일',
   },
   {
     icon: Compass,
     label: '월 1,000만원 버는 부업 비법 공개',
-    prompt: '신뢰감을 주는 다크 그린 & 골드 톤, 실시간 급상승 수익 그래프와 감탄하는 인물 표정 강조, 직관적인 고CTR 썸네일',
+    prompt:
+      '신뢰감을 주는 다크 그린 & 골드 톤, 실시간 급상승 수익 그래프와 감탄하는 인물 표정 강조, 직관적인 고CTR 썸네일',
   },
   {
     icon: Layers,
     label: '초보자도 10분 만에 끝내는 홈트레이닝 루틴',
-    prompt: '에너지 넘치는 오렌지 & 블랙 대비, 땀 흘리며 운동하는 역동적인 포즈, 직관적인 비포애프터 그래픽 배치',
+    prompt:
+      '에너지 넘치는 오렌지 & 블랙 대비, 땀 흘리며 운동하는 역동적인 포즈, 직관적인 비포애프터 그래픽 배치',
   },
 ];
 
@@ -63,9 +78,13 @@ export default function DashboardPage() {
   const { user, loading } = useAuth();
   const router = useRouter();
 
-  // 프롬프트 입력 상태 및 제출 메시지 관리
+  // 상태 관리: 생성 로딩, 에러, 현재 생성된 썸네일, 썸네일 히스토리 목록
   const [isGenerating, setIsGenerating] = useState(false);
   const [submittedMessage, setSubmittedMessage] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [latestThumbnail, setLatestThumbnail] = useState<Thumbnail | null>(null);
+  const [thumbnails, setThumbnails] = useState<Thumbnail[]>([]);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
 
   // ── 비로그인 사용자 /auth 리디렉션 보호 ────────────────────
   useEffect(() => {
@@ -74,26 +93,132 @@ export default function DashboardPage() {
     }
   }, [user, loading, router]);
 
-  // 프롬프트 제출 핸들러
-  const handleSendPrompt = (message: string, files?: File[]) => {
-    console.log('프롬프트 전송:', message);
-    if (files && files.length > 0) {
-      console.log('첨부된 파일:', files);
+  // ── 사용자의 기존 썸네일 목록 불러오기 ──────────────────────
+  const fetchThumbnails = useCallback(async () => {
+    try {
+      const response = await fetch('/api/thumbnails');
+      if (!response.ok) return;
+      const data = await response.json();
+      if (data.success && Array.isArray(data.thumbnails)) {
+        setThumbnails(data.thumbnails);
+      }
+    } catch (err) {
+      console.error('썸네일 목록 로드 중 오류:', err);
     }
+  }, []);
+
+  useEffect(() => {
+    if (user) {
+      fetchThumbnails();
+    }
+  }, [user, fetchThumbnails]);
+
+  // ── 단일 파일을 Base64 객체로 변환하는 유틸 함수 ────────────
+  const convertFileToBase64 = (
+    file: File
+  ): Promise<{ mime_type: string; data: string }> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        const [header, base64Data] = result.split(';base64,');
+        const mimeType = header.replace('data:', '');
+        resolve({ mime_type: mimeType, data: base64Data });
+      };
+      reader.onerror = (error) => reject(error);
+      reader.readAsDataURL(file);
+    });
+  };
+
+  // ── 프롬프트 제출 핸들러 (다중 참조 이미지 지원) ────────────
+  const handleSendPrompt = async (message: string, files?: File[]) => {
+    if (!message.trim() && (!files || files.length === 0)) return;
 
     setIsGenerating(true);
+    setErrorMessage(null);
     setSubmittedMessage(message);
 
-    // AI 생성 시뮬레이션 (3초 후 완료 알림)
-    setTimeout(() => {
+    try {
+      // 1. 첨부된 다중 참조 이미지들을 Base64 배열로 일괄 비동기 변환 (최대 10개)
+      let referenceImagesData: Array<{ mime_type: string; data: string }> = [];
+      if (files && files.length > 0) {
+        const imageFiles = files
+          .filter((f) => f.type.startsWith('image/'))
+          .slice(0, 10);
+        referenceImagesData = await Promise.all(
+          imageFiles.map((file) => convertFileToBase64(file))
+        );
+      }
+
+      // 2. Next.js 서버 Route Handler로 썸네일 생성 요청
+      const response = await fetch('/api/generate-thumbnail', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          prompt: message,
+          reference_images: referenceImagesData, // 다중 이미지 배열 (최대 10개)
+          reference_image: referenceImagesData[0] || null, // 단일 이미지 하위 호환
+          aspect_ratio: '16:9',
+        }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(
+          result.error || '썸네일 생성 중 문제가 발생했습니다. 다시 시도해 주세요.'
+        );
+      }
+
+      // 3. 성공 시 상태 갱신
+      const createdThumbnail: Thumbnail = result.thumbnail;
+      setLatestThumbnail(createdThumbnail);
+      setThumbnails((prev) => [createdThumbnail, ...prev]);
+    } catch (err: unknown) {
+      console.error('썸네일 생성 오류:', err);
+      const msg =
+        err instanceof Error ? err.message : '알 수 없는 오류가 발생했습니다.';
+      setErrorMessage(msg);
+    } finally {
       setIsGenerating(false);
-    }, 3000);
+    }
+  };
+
+  // ── 이미지 다운로드 핸들러 ─────────────────────────────────
+  const handleDownload = async (imageUrl: string, title?: string | null) => {
+    try {
+      const response = await fetch(imageUrl);
+      const blob = await response.blob();
+      const blobUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = `${title || 'nailart-thumbnail'}.png`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(blobUrl);
+    } catch (e) {
+      console.error('다운로드 오류:', e);
+      window.open(imageUrl, '_blank');
+    }
+  };
+
+  // ── 프롬프트 텍스트 클립보드 복사 ───────────────────────────
+  const handleCopyPrompt = (text: string, id: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedId(id);
+    setTimeout(() => setCopiedId(null), 2000);
   };
 
   // 로딩 중일 때 로딩 인디케이터 표시
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center" style={GRID_TILE_STYLE}>
+      <div
+        className="min-h-screen flex items-center justify-center"
+        style={GRID_TILE_STYLE}
+      >
         <div className="flex flex-col items-center gap-4">
           <div className="w-10 h-10 border-2 border-purple-500/20 border-t-purple-500 rounded-full animate-spin" />
           <p className="text-white/40 text-sm">대시보드를 준비하는 중입니다...</p>
@@ -106,21 +231,21 @@ export default function DashboardPage() {
   if (!user) return null;
 
   return (
-    <div className="min-h-screen relative flex flex-col justify-between overflow-x-hidden" style={GRID_TILE_STYLE}>
-      
+    <div
+      className="min-h-screen relative flex flex-col justify-between overflow-x-hidden"
+      style={GRID_TILE_STYLE}
+    >
       {/* ── 1. 대시보드 플로팅 네비게이션 바 (투명 배경 + 독립 알약 버튼) ── */}
       <DashboardNavbar />
 
-      {/* ── 2. 중앙 집중형 대형 PromptArea ── */}
-      <main className="flex-1 flex flex-col items-center justify-center px-4 sm:px-6 md:px-8 py-24 md:py-32 w-full max-w-4xl mx-auto z-10">
-        
+      {/* ── 2. 메인 컨텐츠 영역 ── */}
+      <main className="flex-1 flex flex-col items-center justify-start px-4 sm:px-6 md:px-8 pt-28 pb-20 w-full max-w-5xl mx-auto z-10">
         {/* 상단 헤더 배지 & 타이틀 문구 */}
         <div className="text-center mb-8 flex flex-col items-center animate-in fade-in-50 duration-700">
-          
           {/* 상단 펄스 배지 */}
           <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-white/[0.05] border border-white/10 text-white/80 text-xs md:text-sm font-medium mb-4 backdrop-blur-md shadow-inner">
             <Sparkles className="w-3.5 h-3.5 text-[#A78BFA] animate-pulse" />
-            <span>AI 기반 고효율 유튜브 썸네일 생성기</span>
+            <span>AI 기반 16:9 유튜브 고CTR 썸네일 엔진</span>
           </div>
 
           {/* 메인 헤드라인 */}
@@ -133,12 +258,13 @@ export default function DashboardPage() {
 
           {/* 서브 설명 문구 */}
           <p className="text-sm sm:text-base text-gray-400 max-w-lg mx-auto">
-            영상 주제, 원하는 분위기 또는 참고할 이미지를 전달해 주시면 단 2초 만에 시선을 사로잡는 최적의 썸네일을 기획합니다.
+            영상 주제, 원하는 분위기 또는 참고 이미지(최대 10개, 개당 5MB)를 입력하시면 실시간 AI 모델이
+            시선을 사로잡는 16:9 유튜브 썸네일을 즉시 생성합니다.
           </p>
         </div>
 
-        {/* ── 3. 대형 AI 프롬프트 입력 컴포넌트 (PromptInputBox) ── */}
-        <div className="w-full shadow-2xl relative group rounded-3xl overflow-hidden">
+        {/* ── 3. 대형 AI 프롬프트 입력 박스 (PromptInputBox) ── */}
+        <div className="w-full shadow-2xl relative group rounded-3xl overflow-hidden mb-6">
           {/* 부드러운 백그라운드 글로우 조명 효과 */}
           <div className="absolute -inset-1 bg-gradient-to-r from-purple-600/20 via-sky-500/20 to-purple-600/20 rounded-[28px] blur-xl opacity-60 group-hover:opacity-100 transition duration-1000 -z-10" />
 
@@ -146,17 +272,11 @@ export default function DashboardPage() {
           <PromptInputBox
             onSend={handleSendPrompt}
             isLoading={isGenerating}
-            placeholder="예: 20대 타겟 재테크 유튜브 썸네일, 눈에 띄는 옐로우 타이포와 직관적인 차트 이미지..."
+            placeholder="예: 일본 오사카 감성 여행 브이로그, 노을빛 따뜻한 색감과 큼직한 화이트 캘리그라피 타이틀..."
             className="w-full text-base sm:text-lg border-white/10"
           />
 
-          {/* 
-            PromptInputBox 테두리에 적용된 BorderBeam 효과
-            - duration: 4초 주기
-            - size: 300px 크기의 빛나는 빔
-            - reverse: 역방향 회전
-            - className: 녹색(green-500) 그라디언트 빔 적용
-          */}
+          {/* PromptInputBox 테두리 BorderBeam 효과 (녹색 회전 빔) */}
           <BorderBeam
             duration={4}
             size={300}
@@ -166,28 +286,109 @@ export default function DashboardPage() {
           />
         </div>
 
-        {/* 생성 진행 상태 알림창 (프롬프트 전송 시) */}
-        {submittedMessage && (
-          <div className="w-full mt-4 p-4 rounded-2xl bg-[#1E2023]/90 border border-purple-500/30 backdrop-blur-md flex items-center justify-between text-xs sm:text-sm text-gray-200 animate-in fade-in-50 slide-in-from-top-2">
-            <div className="flex items-center gap-2.5 truncate mr-3">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping flex-shrink-0" />
-              <span className="text-gray-400">입력된 프롬프트:</span>
-              <span className="font-medium text-white truncate max-w-[450px]">{submittedMessage}</span>
+        {/* ── 4. 생성 진행 상태 알림창 또는 에러 메시지 ── */}
+        {isGenerating && (
+          <div className="w-full mb-6 p-4 rounded-2xl bg-[#1E2023]/90 border border-purple-500/40 backdrop-blur-md flex items-center justify-between text-xs sm:text-sm text-gray-200 animate-in fade-in-50 slide-in-from-top-2 shadow-lg">
+            <div className="flex items-center gap-3 truncate mr-3">
+              <span className="w-2.5 h-2.5 rounded-full bg-purple-400 animate-ping flex-shrink-0" />
+              <span className="text-gray-400">AI 썸네일 생성 중:</span>
+              <span className="font-medium text-white truncate max-w-[450px]">
+                {submittedMessage}
+              </span>
             </div>
-            {isGenerating ? (
-              <span className="text-purple-400 flex items-center gap-1.5 flex-shrink-0">
-                <Wand2 className="w-4 h-4 animate-spin" /> 생성 분석 중...
-              </span>
-            ) : (
-              <span className="text-emerald-400 flex items-center gap-1 flex-shrink-0 font-medium">
-                ✓ 준비 완료
-              </span>
-            )}
+            <span className="text-purple-400 flex items-center gap-1.5 flex-shrink-0 font-medium">
+              <Wand2 className="w-4 h-4 animate-spin" /> 이미지 렌더링 중...
+            </span>
           </div>
         )}
 
-        {/* ── 4. 빠른 프롬프트 제안 태그 (칩 형태) ── */}
-        <div className="w-full mt-8">
+        {errorMessage && (
+          <div className="w-full mb-6 p-4 rounded-2xl bg-red-950/40 border border-red-500/40 backdrop-blur-md flex items-center gap-3 text-xs sm:text-sm text-red-200 animate-in fade-in-50 slide-in-from-top-2">
+            <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0" />
+            <span className="flex-1">{errorMessage}</span>
+          </div>
+        )}
+
+        {/* ── 5. 방금 생성된 최신 썸네일 하이라이트 카드 ── */}
+        {latestThumbnail && !isGenerating && (
+          <div className="w-full mb-10 p-5 rounded-3xl bg-[#1F2023]/80 border border-emerald-500/40 backdrop-blur-md shadow-2xl animate-in zoom-in-95 duration-500">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                <span className="text-xs font-bold text-emerald-400 uppercase tracking-wider">
+                  생성 완료 (최신 썸네일)
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleDownload(
+                      latestThumbnail.image_url,
+                      latestThumbnail.title
+                    )
+                  }
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 text-xs font-medium transition cursor-pointer"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>다운로드</span>
+                </button>
+                <a
+                  href={latestThumbnail.image_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="p-1.5 rounded-xl bg-white/5 hover:bg-white/10 text-gray-300 transition"
+                  title="원본 새창 열기"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+              </div>
+            </div>
+
+            {/* 16:9 비율 썸네일 미리보기 */}
+            <div className="relative aspect-video w-full rounded-2xl overflow-hidden bg-black/50 border border-white/10 group">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={latestThumbnail.image_url}
+                alt={latestThumbnail.prompt}
+                className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
+              />
+              <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-4">
+                <p className="text-white text-xs sm:text-sm line-clamp-2">
+                  {latestThumbnail.prompt}
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-3 flex items-center justify-between text-xs text-gray-400">
+              <span className="truncate max-w-[80%]">
+                프롬프트: {latestThumbnail.prompt}
+              </span>
+              <button
+                type="button"
+                onClick={() =>
+                  handleCopyPrompt(latestThumbnail.prompt, latestThumbnail.id)
+                }
+                className="flex items-center gap-1 text-gray-400 hover:text-white transition cursor-pointer"
+              >
+                {copiedId === latestThumbnail.id ? (
+                  <>
+                    <Check className="w-3.5 h-3.5 text-emerald-400" />
+                    <span className="text-emerald-400">복사됨</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>프롬프트 복사</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ── 6. 빠른 프롬프트 제안 태그 (칩 형태) ── */}
+        <div className="w-full mb-12">
           <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3 text-center sm:text-left">
             추천 프롬프트 아이디어
           </p>
@@ -200,12 +401,14 @@ export default function DashboardPage() {
                   key={index}
                   type="button"
                   onClick={() => handleSendPrompt(item.prompt)}
+                  disabled={isGenerating}
                   className="
                     flex items-center gap-3 p-3 rounded-xl text-left
                     bg-[#1F2023]/60 hover:bg-[#282A2E]
                     border border-white/5 hover:border-purple-500/40
                     text-gray-300 hover:text-white
                     transition-all duration-200 cursor-pointer group
+                    disabled:opacity-50 disabled:pointer-events-none
                   "
                 >
                   <div className="p-2 rounded-lg bg-white/5 group-hover:bg-purple-500/20 text-gray-400 group-hover:text-purple-300 transition-colors">
@@ -220,13 +423,85 @@ export default function DashboardPage() {
           </div>
         </div>
 
+        {/* ── 7. 최근 생성한 썸네일 갤러리 섹션 ── */}
+        {thumbnails.length > 0 && (
+          <div className="w-full mt-4">
+            <div className="flex items-center justify-between mb-4 border-b border-white/10 pb-3">
+              <div className="flex items-center gap-2">
+                <Clock className="w-4 h-4 text-purple-400" />
+                <h2 className="text-base sm:text-lg font-bold text-white">
+                  내 썸네일 갤러리 ({thumbnails.length})
+                </h2>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
+              {thumbnails.map((thumb) => (
+                <div
+                  key={thumb.id}
+                  className="group relative rounded-2xl bg-[#1E2023]/70 border border-white/10 hover:border-purple-500/50 overflow-hidden transition-all duration-300 flex flex-col shadow-lg"
+                >
+                  {/* 16:9 썸네일 이미지 */}
+                  <div className="relative aspect-video w-full overflow-hidden bg-black/40">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={thumb.image_url}
+                      alt={thumb.prompt}
+                      className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-105"
+                      loading="lazy"
+                    />
+
+                    {/* 호버 액션 오버레이 (다운로드 & 새창 버튼) */}
+                    <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity duration-200 flex items-center justify-center gap-3">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleDownload(thumb.image_url, thumb.title)
+                        }
+                        className="p-2.5 rounded-full bg-white/20 hover:bg-white/30 text-white backdrop-blur-md transition cursor-pointer"
+                        title="다운로드"
+                      >
+                        <Download className="w-4 h-4" />
+                      </button>
+                      <a
+                        href={thumb.image_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="p-2.5 rounded-full bg-white/20 hover:bg-white/30 text-white backdrop-blur-md transition"
+                        title="원본 보기"
+                      >
+                        <ExternalLink className="w-4 h-4" />
+                      </a>
+                    </div>
+                  </div>
+
+                  {/* 썸네일 텍스트 메타데이터 */}
+                  <div className="p-3.5 flex-1 flex flex-col justify-between">
+                    <p className="text-xs text-gray-300 line-clamp-2 mb-2 font-medium">
+                      {thumb.prompt}
+                    </p>
+                    <div className="flex items-center justify-between text-[11px] text-gray-500 pt-2 border-t border-white/5">
+                      <span>{new Date(thumb.created_at).toLocaleDateString('ko-KR')}</span>
+                      <button
+                        type="button"
+                        onClick={() => handleCopyPrompt(thumb.prompt, thumb.id)}
+                        className="hover:text-gray-300 transition cursor-pointer"
+                      >
+                        {copiedId === thumb.id ? '복사됨' : '프롬프트 복사'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </main>
 
-      {/* ── 5. 하단 미니멀 푸터 안내 ── */}
+      {/* ── 8. 하단 미니멀 푸터 안내 ── */}
       <footer className="w-full py-6 text-center text-xs text-gray-600 border-t border-white/[0.04] z-10">
         <p>© 2026 NailArt-AI. 모든 썸네일 생성 및 저작권은 크리에이터에게 귀속됩니다.</p>
       </footer>
-
     </div>
   );
 }
