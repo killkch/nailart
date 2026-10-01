@@ -10,18 +10,16 @@ import type { Thumbnail } from '@/types/thumbnail';
  * 사용자가 입력한 프롬프트 및 참조 이미지(개당 최대 5MB, 최대 10개)에 맞추어
  * 16:9 고화질 유튜브 썸네일을 실시간으로 생성합니다.
  *
- * [핵심 동작 흐름]
+ * [핵심 크레딧 로직 및 트랜잭션 보장]
  * 1. 세션 인증 검증 (비로그인 차단)
- * 2. 크레딧 잔여량 사전 검증:
- *    - 사용자의 잔여 크레딧이 1개 미만일 경우 402(Payment Required) 반환하여 불필요한 AI 연산 방지
- * 3. 다중 참조 이미지(최대 10개, 개당 5MB 이내) 유효성 검증
- * 4. 1차 시도: Google Gemini 3.1 Flash Lite (gemini-3.1-flash-lite-image) 공식 호출
- * 5. 2차 안전장치: 구글 무료 티어(limit: 0) 감지 시, 외부 유료 결제 에러 없이
- *    100% 신뢰할 수 있는 고해상도 16:9 썸네일 비주얼 엔진으로 즉시 매끄럽게 합성하여 반환
- * 6. 생성된 이미지를 Supabase Storage 'images' 버킷에 사용자별로 저장 (${user.id}/${thumbnailId}.png)
- * 7. Supabase DB 'public.thumbnails' 테이블에 레코드 등록
- * 8. 생성 성공 시 크레딧 1회 차감 (decrement_user_credits RPC 호출)
- * 9. 클라이언트에 썸네일 정보, 잔여 크레딧 및 다운로드 URL 즉시 반환
+ * 2. 프롬프트 유효성 검증
+ * 3. ★ 크레딧 선 차감 (Pre-deduct):
+ *    - 이미지 생성 착수 즉시 1 크레딧을 먼저 차감 (decrement_user_credits RPC)
+ *    - 잔여 크레딧이 1 미만이면 402(Payment Required, INSUFFICIENT_CREDITS)를 반환하여 불필요한 AI 연산 차단
+ * 4. ★ 에러 발생 시 1 크레딧 자동 반환 (Compensation / Refund):
+ *    - AI 렌더링, 스토리지 업로드, DB 저장 등 파이프라인 중간에 오류가 발생하면,
+ *      차감되었던 1 크레딧을 즉시 복구(refund_user_credit RPC / +1)하여 사용자의 크레딧을 보호
+ * 5. 생성 성공 시 최종 차감된 잔여 크레딧과 썸네일 정보 반환
  */
 
 // Gemini Interactions API 요청 페이로드 타입
@@ -155,9 +153,16 @@ async function getHighQualityThumbnailBuffer(prompt: string): Promise<Buffer> {
 }
 
 export async function POST(req: NextRequest) {
+  // 크레딧 선 차감 여부를 추적하는 플래그
+  let isCreditDeducted = false;
+  let targetUserId: string | null = null;
+  let currentSupabase: any = null;
+
   try {
     // ── 1. Supabase 세션 인증 검증 ──────────────────────────────
     const supabase = await createClient();
+    currentSupabase = supabase;
+
     const {
       data: { user },
       error: authError,
@@ -170,28 +175,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ── 2. 사용자 잔여 크레딧 사전 검증 ─────────────────────────
-    const { data: userProfile, error: profileError } = await supabase
-      .from('users')
-      .select('credits, plan')
-      .eq('id', user.id)
-      .maybeSingle();
+    targetUserId = user.id;
 
-    const currentCredits = typeof userProfile?.credits === 'number' ? userProfile.credits : 0;
-
-    if (currentCredits < 1) {
-      console.warn(`[API:generate-thumbnail] 유저(${user.id}) 잔여 크레딧 부족: ${currentCredits}`);
-      return NextResponse.json(
-        {
-          error: 'INSUFFICIENT_CREDITS',
-          message: '잔여 크레딧이 부족합니다. 요금제에서 크레딧을 충전해주세요.',
-          remaining_credits: currentCredits,
-        },
-        { status: 402 } // 402 Payment Required
-      );
-    }
-
-    // ── 3. 클라이언트 요청 데이터 파싱 & 다중 이미지 검증 ───────
+    // ── 2. 클라이언트 요청 데이터 파싱 & 유효성 검사 ────────────
     const body = await req.json();
     const {
       prompt,
@@ -207,13 +193,41 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 다중 참조 이미지 목록 정리 (최대 10개, 개당 5MB 검증)
+    // ── 3. ★ 핵심 로직: 이미지 생성 시작 시 크레딧 1 선 차감 ─────
+    console.log(`[API:generate-thumbnail] 유저(${user.id}) 크레딧 1 선 차감 시도...`);
+    const { data: decrementData, error: decrementError } = await supabase.rpc(
+      'decrement_user_credits',
+      {
+        target_user_id: user.id,
+        amount: 1,
+      }
+    );
+
+    const isDeductSuccess = !decrementError && decrementData && decrementData[0]?.success === true;
+    const remainingCredits = decrementData?.[0]?.remaining_credits ?? 0;
+
+    if (!isDeductSuccess) {
+      console.warn(`[API:generate-thumbnail] 유저(${user.id}) 잔여 크레딧 부족: ${remainingCredits}`);
+      return NextResponse.json(
+        {
+          error: 'INSUFFICIENT_CREDITS',
+          message: '잔여 크레딧이 부족합니다. 요금제에서 크레딧을 충전해주세요.',
+          remaining_credits: remainingCredits,
+        },
+        { status: 402 } // 402 Payment Required
+      );
+    }
+
+    // 1 크레딧 차감 성공 플래그 활성화 (에러 발생 시 반환 대상)
+    isCreditDeducted = true;
+    console.log(`[API:generate-thumbnail] 1 크레딧 선 차감 성공! 잔여 크레딧: ${remainingCredits}`);
+
+    // ── 4. 다중 참조 이미지 정리 (최대 10개, 개당 5MB 검증) ──────
     const validImages: Array<{ mime_type: string; data: string }> = [];
 
     if (Array.isArray(reference_images) && reference_images.length > 0) {
       for (const img of reference_images.slice(0, 10)) {
         if (img?.data && img?.mime_type) {
-          // Base64 대략적 크기 계산 (5MB 이하 검증)
           const approxBytes = (img.data.length * 3) / 4;
           if (approxBytes <= 5.5 * 1024 * 1024) {
             validImages.push(img);
@@ -227,7 +241,7 @@ export async function POST(req: NextRequest) {
     let imageBuffer: Buffer | null = null;
     let engineUsed = 'Gemini 3.1 Flash Lite';
 
-    // ── 4. Google Gemini 3.1 Flash Lite 1차 호출 시도 ────────────
+    // ── 5. Google Gemini 3.1 Flash Lite 1차 호출 시도 ────────────
     const geminiApiKey = process.env.GEMINI_API_KEY;
 
     if (geminiApiKey) {
@@ -239,7 +253,6 @@ export async function POST(req: NextRequest) {
           },
         ];
 
-        // 유효한 다중 참조 이미지들을 모두 input에 추가 (최대 10개)
         for (const img of validImages) {
           inputContents.push({
             type: 'image',
@@ -303,7 +316,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // ── 5. Gemini Free Tier 차단 시 안전한 고화질 16:9 비주얼 엔진으로 자동 대응 ─
+    // ── 6. Gemini Free Tier 차단 시 안전한 고화질 16:9 비주얼 엔진으로 자동 대응 ─
     if (!imageBuffer) {
       console.log(
         '[API:generate-thumbnail] 고화질 16:9 썸네일 엔진으로 안전하게 자동 생성...'
@@ -312,7 +325,7 @@ export async function POST(req: NextRequest) {
       imageBuffer = await getHighQualityThumbnailBuffer(prompt);
     }
 
-    // ── 6. 고유 ID 생성 및 Supabase Storage 'images' 버킷에 업로드 ───
+    // ── 7. 고유 ID 생성 및 Supabase Storage 'images' 버킷에 업로드 ───
     const thumbnailId = crypto.randomUUID();
     const storagePath = `${user.id}/${thumbnailId}.png`;
 
@@ -325,19 +338,22 @@ export async function POST(req: NextRequest) {
       });
 
     if (uploadError) {
+      // 업로드 실패 시 차감했던 1 크레딧 즉시 환불
       console.error('[API:generate-thumbnail] 스토리지 업로드 오류:', uploadError);
+      await supabase.rpc('refund_user_credit', { target_user_id: user.id, amount: 1 });
+      isCreditDeducted = false; // 환불 완료 처리
       return NextResponse.json(
         { error: `스토리지 업로드 실패: ${uploadError.message}` },
         { status: 500 }
       );
     }
 
-    // ── 7. 업로드된 파일의 Public URL 취득 ─────────────────────
+    // ── 8. 업로드된 파일의 Public URL 취득 ─────────────────────
     const {
       data: { publicUrl },
     } = supabase.storage.from('images').getPublicUrl(storagePath);
 
-    // ── 8. Supabase DB 'public.thumbnails' 테이블에 레코드 INSERT ───
+    // ── 9. Supabase DB 'public.thumbnails' 테이블에 레코드 INSERT ───
     console.log('[API:generate-thumbnail] DB thumbnails 레코드 저장...');
     const newThumbnailRecord = {
       id: thumbnailId,
@@ -357,34 +373,18 @@ export async function POST(req: NextRequest) {
       .single();
 
     if (dbError) {
+      // DB 저장 실패 시 차감했던 1 크레딧 즉시 환불
       console.error('[API:generate-thumbnail] DB INSERT 오류:', dbError);
+      await supabase.rpc('refund_user_credit', { target_user_id: user.id, amount: 1 });
+      isCreditDeducted = false; // 환불 완료 처리
       return NextResponse.json(
         { error: `데이터베이스 저장 실패: ${dbError.message}` },
         { status: 500 }
       );
     }
 
-    // ── 9. 생성 완료 후 1 크레딧 원자적 차감 (decrement_user_credits RPC) ───
-    let remainingCredits = currentCredits - 1;
-    try {
-      const { data: decrementData, error: decrementError } = await supabase.rpc(
-        'decrement_user_credits',
-        {
-          target_user_id: user.id,
-          amount: 1,
-        }
-      );
-
-      if (!decrementError && decrementData && decrementData.length > 0) {
-        remainingCredits = decrementData[0].remaining_credits;
-      }
-      console.log(`[API:generate-thumbnail] 크레딧 1 차감 완료. 잔여 크레딧: ${remainingCredits}`);
-    } catch (decErr) {
-      console.error('[API:generate-thumbnail] 크레딧 차감 RPC 예외:', decErr);
-    }
-
     console.log(
-      `[API:generate-thumbnail] 썸네일 생성 및 DB 저장 성공: ${thumbnailId} (${engineUsed}, 잔여 크레딧: ${remainingCredits})`
+      `[API:generate-thumbnail] 썸네일 생성 완료: ${thumbnailId} (${engineUsed}, 잔여 크레딧: ${remainingCredits})`
     );
 
     // ── 10. 최종 성공 응답 반환 ────────────────────────────────
@@ -398,6 +398,26 @@ export async function POST(req: NextRequest) {
     const errorMessage =
       error instanceof Error ? error.message : '알 수 없는 오류가 발생했습니다.';
     console.error('[API:generate-thumbnail] 서버 예외 발생:', error);
+
+    // ── ★ 핵심: 예외 발생 시 선 차감된 1 크레딧 안전 복구(환불) ───
+    if (isCreditDeducted && targetUserId && currentSupabase) {
+      try {
+        console.log(`[API:generate-thumbnail] 오류 발생으로 유저(${targetUserId})의 1 크레딧 복구 진행...`);
+        const { data: refundData, error: refundErr } = await currentSupabase.rpc(
+          'refund_user_credit',
+          {
+            target_user_id: targetUserId,
+            amount: 1,
+          }
+        );
+        if (!refundErr) {
+          console.log(`[API:generate-thumbnail] 1 크레딧 복구 성공! 최신 잔여 크레딧: ${refundData?.[0]?.restored_credits}`);
+        }
+      } catch (refundCatchError) {
+        console.error('[API:generate-thumbnail] 크레딧 복구 도중 추가 예외 발생:', refundCatchError);
+      }
+    }
+
     return NextResponse.json({ error: errorMessage }, { status: 500 });
   }
 }

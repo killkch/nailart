@@ -164,8 +164,12 @@ function NavbarAuthArea() {
 export default function Navbar() {
   const pathname = usePathname();
 
-  // 대시보드 페이지에서는 대시보드 전용 Navbar를 사용하므로 숨김 처리합니다.
-  if (pathname?.startsWith('/dashboard')) {
+  // 대시보드, 약관, 개인정보처리방침 페이지에서는 자체 레이아웃을 사용하므로 숨김 처리합니다.
+  if (
+    pathname?.startsWith('/dashboard') ||
+    pathname?.startsWith('/terms') ||
+    pathname?.startsWith('/privacy')
+  ) {
     return null;
   }
 

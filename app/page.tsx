@@ -6,14 +6,28 @@
  */
 
 import LandingHero from '@/components/main/hero/LandingHero';
+import FeaturesSection from '@/components/main/features/FeaturesSection';
+import PricingSection from '@/components/main/pricing/PricingSection';
+import CtaSection from '@/components/main/cta/CtaSection';
+import FooterSection from '@/components/main/footer/FooterSection';
 
 export default function Home() {
   return (
-    <main>
+    <main className="w-full bg-[#050508] overflow-x-hidden">
       {/* 히어로 섹션: WebGL 셰이더 배경 + 카피 + CTA */}
       <LandingHero />
 
-      {/* TODO: Features 섹션, Pricing 섹션 등 추가 예정 */}
+      {/* 피처 섹션: 5종의 썸네일 쇼케이스 벤토 그리드 */}
+      <FeaturesSection />
+
+      {/* 요금제 섹션: Pro & Ultra 2종 카드 뷰 */}
+      <PricingSection />
+
+      {/* 최종 전환 CTA 섹션: 박스 형태 & BorderBeam */}
+      <CtaSection />
+
+      {/* 하단 박스 형태 프리미엄 푸터 */}
+      <FooterSection />
     </main>
   );
 }

@@ -16,25 +16,23 @@
  *    - PromptArea와 동일한 BorderBeam 컴포넌트를 모달 컨테이너 외곽 전체에 적용하여
  *      테두리를 따라 빛나는 세련된 비주얼을 제공합니다.
  *
- * 3. 심플한 가격 카드 (2종):
- *    - 사용자 요청에 따라 불필요한 기능 나열 없이 오직 가격과 크레딧 정보만 직관적으로 제공합니다.
- *      - Pro: ₩20,000 (2만원) / 100 크레딧
- *      - Ultra: ₩40,000 (4만원) / 300 크레딧
+ * 3. 크레딧 부족 상황 맞춤형 UI (isOutOfCredits):
+ *    - 사용자가 썸네일 생성 시 크레딧이 부족한 경우, 위압적인 에러 메시지 대신
+ *      "잔여 크레딧 소진 ⚡ / 크레딧을 충전하고 생성을 계속하세요"라는 맞춤형 안내로
+ *      자연스럽게 결제를 유도합니다.
  *
- * 4. Polar Checkout 세션 연동:
+ * 4. 심플한 가격 카드 (2종):
+ *    - Pro: ₩20,000 (2만원) / 100 크레딧
+ *    - Ultra: ₩40,000 (4만원) / 300 크레딧 (인기 플랜 배지)
+ *
+ * 5. Polar Checkout 세션 연동:
  *    - 버튼 클릭 시 /api/checkout API를 호출하여 Polar 결제 세션을 생성하고
  *      발급받은 결제 페이지(checkout.url)로 안전하게 이동합니다.
- *    - 로딩 중에는 버튼에 회전 스피너와 함께 진행 상태가 표시되어 중복 클릭을 방지합니다.
- *
- * 5. UX 및 접근성:
- *    - ESC 키 누름 시 모달 닫기
- *    - 바깥쪽 어두운 배경(오버레이) 클릭 시 모달 닫기
- *    - 모달 내부 클릭 시 이벤트 버블링 차단 (stopPropagation)
  */
 
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { X, Sparkles, Zap, Loader2 } from 'lucide-react';
+import { X, Sparkles, Zap, Loader2, AlertCircle } from 'lucide-react';
 import { BorderBeam } from '@/components/ui/border-beam';
 
 interface PricingModalProps {
@@ -42,9 +40,15 @@ interface PricingModalProps {
   isOpen: boolean;
   /** 모달 닫기 함수 */
   onClose: () => void;
+  /** 크레딧 소진으로 인해 열린 것인지 여부 */
+  isOutOfCredits?: boolean;
 }
 
-export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
+export default function PricingModal({
+  isOpen,
+  onClose,
+  isOutOfCredits = false,
+}: PricingModalProps) {
   // SSR 환경에서 document 접근 에러를 방지하기 위한 마운트 상태 플래그
   const [mounted, setMounted] = useState<boolean>(false);
 
@@ -61,14 +65,12 @@ export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
     if (!isOpen) return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
-      // 결제 진행 중에는 닫히지 않도록 보호
       if (e.key === 'Escape' && !loadingPlan) {
         onClose();
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
-    // 모달이 열려 있을 때 배경 스크롤 방지
     document.body.style.overflow = 'hidden';
 
     return () => {
@@ -82,7 +84,6 @@ export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
     try {
       setLoadingPlan(plan);
 
-      // 서버의 Polar 결제 세션 생성 API 호출
       const response = await fetch('/api/checkout', {
         method: 'POST',
         headers: {
@@ -97,7 +98,6 @@ export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
         throw new Error(data.error || '결제 페이지를 불러오는 데 실패했습니다.');
       }
 
-      // 발급받은 Polar 결제창 URL로 리다이렉트
       window.location.href = data.url;
     } catch (err: any) {
       console.error('결제 세션 이동 오류:', err);
@@ -106,10 +106,8 @@ export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
     }
   };
 
-  // 서버 렌더링 중이거나 모달이 닫혀있는 경우에는 아무것도 렌더링하지 않음
   if (!mounted || !isOpen) return null;
 
-  // React Portal을 사용하여 document.body 바로 아래에 모달 렌더링
   return createPortal(
     <div
       role="dialog"
@@ -119,9 +117,8 @@ export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
     >
       {/* ─── 어두운 반투명 블러 배경 (오버레이) ─── */}
       <div
-        className="fixed inset-0 bg-black/75 backdrop-blur-md transition-opacity"
+        className="fixed inset-0 bg-black/80 backdrop-blur-md transition-opacity"
         onClick={() => {
-          // 결제 처리 중에는 배경 클릭으로 닫히지 않도록 방지
           if (!loadingPlan) onClose();
         }}
         aria-hidden="true"
@@ -129,20 +126,17 @@ export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
 
       {/* ─── 모달 메인 컨테이너 ─── */}
       <div
-        onClick={(e) => e.stopPropagation()} // 모달 내부 클릭 시 닫힘 방지
+        onClick={(e) => e.stopPropagation()}
         className="
           relative w-full max-w-xl rounded-3xl
           bg-[#18191C]/95 backdrop-blur-2xl
           border border-white/10
           p-6 sm:p-8
-          shadow-[0_24px_64px_rgba(0,0,0,0.8)]
+          shadow-[0_24px_64px_rgba(0,0,0,0.85)]
           overflow-hidden z-10
         "
       >
-        {/* 
-          프롬프트 입력창(PromptArea)과 동일한 BorderBeam 적용:
-          - 테두리를 따라 에메랄드/그린 빛이 회전하는 효과 연출
-        */}
+        {/* 테두리 BorderBeam 효과 */}
         <BorderBeam
           duration={4}
           size={300}
@@ -173,15 +167,25 @@ export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
 
         {/* 모달 타이틀 헤더 */}
         <div className="text-center mb-7">
-          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-green-500/10 border border-green-500/20 text-green-400 text-xs font-semibold mb-3">
-            <Sparkles className="w-3.5 h-3.5" />
-            <span>크레딧 충전 플랜</span>
-          </div>
+          {isOutOfCredits ? (
+            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs font-semibold mb-3 animate-pulse">
+              <Zap className="w-3.5 h-3.5" />
+              <span>잔여 크레딧 소진 (충전 필요)</span>
+            </div>
+          ) : (
+            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-green-500/10 border border-green-500/20 text-green-400 text-xs font-semibold mb-3">
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>크레딧 충전 플랜</span>
+            </div>
+          )}
+
           <h2 id="pricing-modal-title" className="text-xl sm:text-2xl font-bold text-white tracking-tight">
-            원하는 플랜을 선택하세요
+            {isOutOfCredits ? '크레딧을 충전하고 생성을 이어가세요!' : '원하는 플랜을 선택하세요'}
           </h2>
-          <p className="text-xs sm:text-sm text-gray-400 mt-1">
-            필요한 만큼 충전하고 나만의 유튜브 썸네일을 자유롭게 제작해보세요.
+          <p className="text-xs sm:text-sm text-gray-400 mt-1 max-w-md mx-auto">
+            {isOutOfCredits
+              ? '잔여 크레딧이 모두 사용되었습니다. 원하는 플랜을 결제하시면 즉시 크레딧이 충전되어 고화질 썸네일 생성을 계속할 수 있습니다.'
+              : '필요한 만큼 충전하고 나만의 유튜브 썸네일을 자유롭게 제작해보세요.'}
           </p>
         </div>
 
@@ -200,7 +204,6 @@ export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
             "
           >
             <div>
-              {/* 플랜 이름 */}
               <div className="flex items-center justify-between mb-4">
                 <span className="text-base font-bold text-white tracking-wide">
                   Pro
@@ -210,7 +213,6 @@ export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
                 </span>
               </div>
 
-              {/* 가격 정보 (2만원) */}
               <div className="mb-4">
                 <div className="flex items-baseline gap-1">
                   <span className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">
@@ -220,7 +222,6 @@ export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
                 </div>
               </div>
 
-              {/* 크레딧 정보 (강조) */}
               <div className="flex items-center gap-2 p-3 rounded-xl bg-white/5 border border-white/5 mb-6">
                 <Zap className="w-4 h-4 text-emerald-400 shrink-0" />
                 <span className="text-sm font-semibold text-emerald-300">
@@ -229,7 +230,6 @@ export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
               </div>
             </div>
 
-            {/* 결제/선택 버튼 */}
             <button
               type="button"
               disabled={loadingPlan !== null}
@@ -266,7 +266,6 @@ export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
               shadow-lg group
             "
           >
-            {/* 상단 추천 배지 */}
             <div className="absolute -top-3 right-4">
               <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-gradient-to-r from-emerald-500 to-green-400 text-black shadow-md">
                 인기 플랜
@@ -274,7 +273,6 @@ export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
             </div>
 
             <div>
-              {/* 플랜 이름 */}
               <div className="flex items-center justify-between mb-4">
                 <span className="text-base font-bold text-white tracking-wide flex items-center gap-1.5">
                   Ultra
@@ -285,7 +283,6 @@ export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
                 </span>
               </div>
 
-              {/* 가격 정보 (4만원) */}
               <div className="mb-4">
                 <div className="flex items-baseline gap-1">
                   <span className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">
@@ -295,7 +292,6 @@ export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
                 </div>
               </div>
 
-              {/* 크레딧 정보 (강조) */}
               <div className="flex items-center gap-2 p-3 rounded-xl bg-green-500/10 border border-green-500/20 mb-6">
                 <Zap className="w-4 h-4 text-green-400 shrink-0" />
                 <span className="text-sm font-semibold text-green-300">
@@ -304,7 +300,6 @@ export default function PricingModal({ isOpen, onClose }: PricingModalProps) {
               </div>
             </div>
 
-            {/* 결제/선택 버튼 */}
             <button
               type="button"
               disabled={loadingPlan !== null}

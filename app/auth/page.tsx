@@ -302,13 +302,19 @@ function RightPanel() {
         </div>
 
         {/* ── 하단 약관 ── */}
-        <p className="text-[0.72rem] text-white/25 text-center leading-relaxed m-0">
+        <p className="text-[0.75rem] text-white/40 text-center leading-relaxed m-0">
           계속 진행하면 NailArt-AI의{' '}
-          <Link href="#" className="text-white/45 underline underline-offset-2 hover:text-white/70 transition-colors">
+          <Link
+            href="/terms"
+            className="text-purple-400 hover:text-purple-300 underline underline-offset-2 transition-colors font-medium cursor-pointer"
+          >
             서비스 이용약관
           </Link>{' '}
           및{' '}
-          <Link href="#" className="text-white/45 underline underline-offset-2 hover:text-white/70 transition-colors">
+          <Link
+            href="/privacy"
+            className="text-purple-400 hover:text-purple-300 underline underline-offset-2 transition-colors font-medium cursor-pointer"
+          >
             개인정보 처리방침
           </Link>
           에 동의하게 됩니다.
