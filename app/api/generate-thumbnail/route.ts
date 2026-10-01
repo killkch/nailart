@@ -12,13 +12,16 @@ import type { Thumbnail } from '@/types/thumbnail';
  *
  * [핵심 동작 흐름]
  * 1. 세션 인증 검증 (비로그인 차단)
- * 2. 다중 참조 이미지(최대 10개, 개당 5MB 이내) 유효성 검증
- * 3. 1차 시도: Google Gemini 3.1 Flash Lite (gemini-3.1-flash-lite-image) 공식 호출
- * 4. 2차 안전장치: 구글 무료 티어(limit: 0) 감지 시, 외부 유료 결제 에러 없이
+ * 2. 크레딧 잔여량 사전 검증:
+ *    - 사용자의 잔여 크레딧이 1개 미만일 경우 402(Payment Required) 반환하여 불필요한 AI 연산 방지
+ * 3. 다중 참조 이미지(최대 10개, 개당 5MB 이내) 유효성 검증
+ * 4. 1차 시도: Google Gemini 3.1 Flash Lite (gemini-3.1-flash-lite-image) 공식 호출
+ * 5. 2차 안전장치: 구글 무료 티어(limit: 0) 감지 시, 외부 유료 결제 에러 없이
  *    100% 신뢰할 수 있는 고해상도 16:9 썸네일 비주얼 엔진으로 즉시 매끄럽게 합성하여 반환
- * 5. 생성된 이미지를 Supabase Storage 'images' 버킷에 사용자별로 저장 (${user.id}/${thumbnailId}.png)
- * 6. Supabase DB 'public.thumbnails' 테이블에 레코드 등록
- * 7. 클라이언트에 썸네일 정보 및 다운로드 URL 즉시 반환
+ * 6. 생성된 이미지를 Supabase Storage 'images' 버킷에 사용자별로 저장 (${user.id}/${thumbnailId}.png)
+ * 7. Supabase DB 'public.thumbnails' 테이블에 레코드 등록
+ * 8. 생성 성공 시 크레딧 1회 차감 (decrement_user_credits RPC 호출)
+ * 9. 클라이언트에 썸네일 정보, 잔여 크레딧 및 다운로드 URL 즉시 반환
  */
 
 // Gemini Interactions API 요청 페이로드 타입
@@ -167,7 +170,28 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ── 2. 클라이언트 요청 데이터 파싱 & 다중 이미지 검증 ───────
+    // ── 2. 사용자 잔여 크레딧 사전 검증 ─────────────────────────
+    const { data: userProfile, error: profileError } = await supabase
+      .from('users')
+      .select('credits, plan')
+      .eq('id', user.id)
+      .maybeSingle();
+
+    const currentCredits = typeof userProfile?.credits === 'number' ? userProfile.credits : 0;
+
+    if (currentCredits < 1) {
+      console.warn(`[API:generate-thumbnail] 유저(${user.id}) 잔여 크레딧 부족: ${currentCredits}`);
+      return NextResponse.json(
+        {
+          error: 'INSUFFICIENT_CREDITS',
+          message: '잔여 크레딧이 부족합니다. 요금제에서 크레딧을 충전해주세요.',
+          remaining_credits: currentCredits,
+        },
+        { status: 402 } // 402 Payment Required
+      );
+    }
+
+    // ── 3. 클라이언트 요청 데이터 파싱 & 다중 이미지 검증 ───────
     const body = await req.json();
     const {
       prompt,
@@ -203,7 +227,7 @@ export async function POST(req: NextRequest) {
     let imageBuffer: Buffer | null = null;
     let engineUsed = 'Gemini 3.1 Flash Lite';
 
-    // ── 3. Google Gemini 3.1 Flash Lite 1차 호출 시도 ────────────
+    // ── 4. Google Gemini 3.1 Flash Lite 1차 호출 시도 ────────────
     const geminiApiKey = process.env.GEMINI_API_KEY;
 
     if (geminiApiKey) {
@@ -279,7 +303,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // ── 4. Gemini Free Tier 차단 시 안전한 고화질 16:9 비주얼 엔진으로 자동 대응 ─
+    // ── 5. Gemini Free Tier 차단 시 안전한 고화질 16:9 비주얼 엔진으로 자동 대응 ─
     if (!imageBuffer) {
       console.log(
         '[API:generate-thumbnail] 고화질 16:9 썸네일 엔진으로 안전하게 자동 생성...'
@@ -288,7 +312,7 @@ export async function POST(req: NextRequest) {
       imageBuffer = await getHighQualityThumbnailBuffer(prompt);
     }
 
-    // ── 5. 고유 ID 생성 및 Supabase Storage 'images' 버킷에 업로드 ───
+    // ── 6. 고유 ID 생성 및 Supabase Storage 'images' 버킷에 업로드 ───
     const thumbnailId = crypto.randomUUID();
     const storagePath = `${user.id}/${thumbnailId}.png`;
 
@@ -308,12 +332,12 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ── 6. 업로드된 파일의 Public URL 취득 ─────────────────────
+    // ── 7. 업로드된 파일의 Public URL 취득 ─────────────────────
     const {
       data: { publicUrl },
     } = supabase.storage.from('images').getPublicUrl(storagePath);
 
-    // ── 7. Supabase DB 'public.thumbnails' 테이블에 레코드 INSERT ───
+    // ── 8. Supabase DB 'public.thumbnails' 테이블에 레코드 INSERT ───
     console.log('[API:generate-thumbnail] DB thumbnails 레코드 저장...');
     const newThumbnailRecord = {
       id: thumbnailId,
@@ -340,15 +364,35 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // ── 9. 생성 완료 후 1 크레딧 원자적 차감 (decrement_user_credits RPC) ───
+    let remainingCredits = currentCredits - 1;
+    try {
+      const { data: decrementData, error: decrementError } = await supabase.rpc(
+        'decrement_user_credits',
+        {
+          target_user_id: user.id,
+          amount: 1,
+        }
+      );
+
+      if (!decrementError && decrementData && decrementData.length > 0) {
+        remainingCredits = decrementData[0].remaining_credits;
+      }
+      console.log(`[API:generate-thumbnail] 크레딧 1 차감 완료. 잔여 크레딧: ${remainingCredits}`);
+    } catch (decErr) {
+      console.error('[API:generate-thumbnail] 크레딧 차감 RPC 예외:', decErr);
+    }
+
     console.log(
-      `[API:generate-thumbnail] 썸네일 생성 및 DB 저장 성공: ${thumbnailId} (${engineUsed}, 참조 이미지 ${validImages.length}개)`
+      `[API:generate-thumbnail] 썸네일 생성 및 DB 저장 성공: ${thumbnailId} (${engineUsed}, 잔여 크레딧: ${remainingCredits})`
     );
 
-    // ── 8. 최종 성공 응답 반환 ─────────────────────────────────
+    // ── 10. 최종 성공 응답 반환 ────────────────────────────────
     return NextResponse.json({
       success: true,
       engine: engineUsed,
       thumbnail: insertedThumbnail as Thumbnail,
+      remaining_credits: remainingCredits,
     });
   } catch (error: unknown) {
     const errorMessage =

@@ -7,11 +7,13 @@
  * ─────────────────────────────────────────────────────────────
  * [주요 기능]
  * 1. 단일 그리드 타일 배경 디자인 (#181818)
- * 2. 독립 알약 버튼 스타일의 DashboardNavbar 연동
+ * 2. 독립 알약 버튼 스타일의 DashboardNavbar 연동 (실시간 잔여 크레딧 표시)
  * 3. 중앙 집중형 PromptArea(PromptInputBox) + 녹색 BorderBeam 디자인
  * 4. 다중 참조 이미지(개당 5MB, 최대 10개) 및 프롬프트 기반 썸네일 생성 API 연동
- * 5. 생성된 16:9 썸네일 즉시 미리보기 및 원클릭 다운로드
- * 6. 하단 "내 썸네일 갤러리" 실시간 동기화
+ * 5. 생성 시 1회당 1크레딧 자동 차감 및 잔여 크레딧 부족 시 결제(Pricing) 모달 자동 팝업 유도
+ * 6. 결제 성공 리다이렉트(?checkout=success) 시 크레딧 즉시 자동 검증 및 실시간 합산 충전
+ * 7. 생성된 16:9 썸네일 즉시 미리보기 및 원클릭 다운로드
+ * 8. 하단 "내 썸네일 갤러리" 실시간 동기화
  */
 
 import React, { useState, useEffect, useCallback } from 'react';
@@ -28,9 +30,12 @@ import {
   AlertCircle,
   Copy,
   Check,
+  CreditCard,
+  PartyPopper,
 } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
 import DashboardNavbar from '@/components/dashboard/DashboardNavbar';
+import PricingModal from '@/components/dashboard/PricingModal';
 import { PromptInputBox } from '@/components/ui/ai-prompt-box';
 import { BorderBeam } from '@/components/ui/border-beam';
 import type { Thumbnail } from '@/types/thumbnail';
@@ -78,13 +83,18 @@ export default function DashboardPage() {
   const { user, loading } = useAuth();
   const router = useRouter();
 
-  // 상태 관리: 생성 로딩, 에러, 현재 생성된 썸네일, 썸네일 히스토리 목록
+  // 상태 관리: 생성 로딩, 에러, 결제 성공 메시지, 썸네일 히스토리 목록
   const [isGenerating, setIsGenerating] = useState(false);
   const [submittedMessage, setSubmittedMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [isCreditInsufficient, setIsCreditInsufficient] = useState(false);
   const [latestThumbnail, setLatestThumbnail] = useState<Thumbnail | null>(null);
   const [thumbnails, setThumbnails] = useState<Thumbnail[]>([]);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  // 크레딧 부족 시 팝업되는 요금제(Pricing) 모달 상태
+  const [isPricingModalOpen, setIsPricingModalOpen] = useState(false);
 
   // ── 비로그인 사용자 /auth 리디렉션 보호 ────────────────────
   useEffect(() => {
@@ -92,6 +102,50 @@ export default function DashboardPage() {
       router.replace('/auth');
     }
   }, [user, loading, router]);
+
+  // ── 결제 완료 복귀 URL(?checkout=success) 자동 검증 및 크레딧 충전 ──
+  useEffect(() => {
+    if (!user) return;
+
+    const queryParams = new URLSearchParams(window.location.search);
+    const isCheckoutSuccess = queryParams.get('checkout') === 'success';
+    const sessionId = queryParams.get('session_id');
+
+    if (isCheckoutSuccess) {
+      const verifyAndAddCredits = async () => {
+        try {
+          const verifyUrl = sessionId
+            ? `/api/checkout/verify?session_id=${encodeURIComponent(sessionId)}`
+            : `/api/checkout/verify`;
+
+          const response = await fetch(verifyUrl);
+          const data = await response.json();
+
+          if (data.success) {
+            const added = data.creditsAdded || data.syncedCredits || 0;
+            if (added > 0) {
+              setSuccessMessage(`결제가 성공적으로 완료되어 ${added} 크레딧이 충전되었습니다! 🎉`);
+            } else {
+              setSuccessMessage('결제가 확인되어 크레딧이 정상 반영되었습니다! 🎉');
+            }
+
+            // 상단 네비게이션 바에 최신 크레딧 즉시 동기화
+            window.dispatchEvent(new Event('credit-updated'));
+
+            // 5초 후 축하 배너 자동 숨김
+            setTimeout(() => setSuccessMessage(null), 7000);
+          }
+        } catch (err) {
+          console.error('결제 검증 오류:', err);
+        } finally {
+          // 주소창의 쿼리스트링 정리 (새로고침 시 중복 호출 방지)
+          router.replace('/dashboard');
+        }
+      };
+
+      verifyAndAddCredits();
+    }
+  }, [user, router]);
 
   // ── 사용자의 기존 썸네일 목록 불러오기 ──────────────────────
   const fetchThumbnails = useCallback(async () => {
@@ -130,12 +184,13 @@ export default function DashboardPage() {
     });
   };
 
-  // ── 프롬프트 제출 핸들러 (다중 참조 이미지 지원) ────────────
+  // ── 프롬프트 제출 핸들러 (다중 참조 이미지 & 크레딧 검증) ───
   const handleSendPrompt = async (message: string, files?: File[]) => {
     if (!message.trim() && (!files || files.length === 0)) return;
 
     setIsGenerating(true);
     setErrorMessage(null);
+    setIsCreditInsufficient(false);
     setSubmittedMessage(message);
 
     try {
@@ -166,16 +221,32 @@ export default function DashboardPage() {
 
       const result = await response.json();
 
+      // ── 크레딧 부족 (402 Payment Required) 처리 ───────────────
+      if (response.status === 402 || result.error === 'INSUFFICIENT_CREDITS') {
+        setIsCreditInsufficient(true);
+        setErrorMessage(
+          result.message || '잔여 크레딧이 부족합니다. 요금제에서 크레딧을 충전해주세요.'
+        );
+        // 사용자 편의를 위해 즉시 요금제 모달 팝업 자동 오픈!
+        setIsPricingModalOpen(true);
+        return;
+      }
+
       if (!response.ok || !result.success) {
         throw new Error(
           result.error || '썸네일 생성 중 문제가 발생했습니다. 다시 시도해 주세요.'
         );
       }
 
-      // 3. 성공 시 상태 갱신
+      // 3. 성공 시 상태 갱신 및 네브바 크레딧 동기화 이벤트 발송
       const createdThumbnail: Thumbnail = result.thumbnail;
       setLatestThumbnail(createdThumbnail);
       setThumbnails((prev) => [createdThumbnail, ...prev]);
+
+      // 상단 네비게이션 바에 크레딧 1 차감 반영을 위한 전역 이벤트 발생
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('credit-updated'));
+      }
     } catch (err: unknown) {
       console.error('썸네일 생성 오류:', err);
       const msg =
@@ -235,7 +306,7 @@ export default function DashboardPage() {
       className="min-h-screen relative flex flex-col justify-between overflow-x-hidden"
       style={GRID_TILE_STYLE}
     >
-      {/* ── 1. 대시보드 플로팅 네비게이션 바 (투명 배경 + 독립 알약 버튼) ── */}
+      {/* ── 1. 대시보드 플로팅 네비게이션 바 (실시간 크레딧 표시) ── */}
       <DashboardNavbar />
 
       {/* ── 2. 메인 컨텐츠 영역 ── */}
@@ -259,7 +330,7 @@ export default function DashboardPage() {
           {/* 서브 설명 문구 */}
           <p className="text-sm sm:text-base text-gray-400 max-w-lg mx-auto">
             영상 주제, 원하는 분위기 또는 참고 이미지(최대 10개, 개당 5MB)를 입력하시면 실시간 AI 모델이
-            시선을 사로잡는 16:9 유튜브 썸네일을 즉시 생성합니다.
+            시선을 사로잡는 16:9 유튜브 썸네일을 즉시 생성합니다. (1회당 1크레딧 사용)
           </p>
         </div>
 
@@ -286,7 +357,15 @@ export default function DashboardPage() {
           />
         </div>
 
-        {/* ── 4. 생성 진행 상태 알림창 또는 에러 메시지 ── */}
+        {/* ── 4-1. 결제 완료 성공 축하 알림 배너 ── */}
+        {successMessage && (
+          <div className="w-full mb-6 p-4 rounded-2xl bg-emerald-950/40 border border-emerald-500/40 backdrop-blur-md flex items-center gap-3 text-xs sm:text-sm text-emerald-200 animate-in fade-in-50 slide-in-from-top-2 shadow-lg">
+            <PartyPopper className="w-5 h-5 text-emerald-400 shrink-0" />
+            <span className="flex-1 font-medium">{successMessage}</span>
+          </div>
+        )}
+
+        {/* ── 4-2. 생성 진행 상태 알림창 ── */}
         {isGenerating && (
           <div className="w-full mb-6 p-4 rounded-2xl bg-[#1E2023]/90 border border-purple-500/40 backdrop-blur-md flex items-center justify-between text-xs sm:text-sm text-gray-200 animate-in fade-in-50 slide-in-from-top-2 shadow-lg">
             <div className="flex items-center gap-3 truncate mr-3">
@@ -302,10 +381,28 @@ export default function DashboardPage() {
           </div>
         )}
 
+        {/* ── 4-3. 에러 메시지 알림창 (크레딧 부족 시 충전 버튼 제공) ── */}
         {errorMessage && (
-          <div className="w-full mb-6 p-4 rounded-2xl bg-red-950/40 border border-red-500/40 backdrop-blur-md flex items-center gap-3 text-xs sm:text-sm text-red-200 animate-in fade-in-50 slide-in-from-top-2">
-            <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0" />
-            <span className="flex-1">{errorMessage}</span>
+          <div className="w-full mb-6 p-4 rounded-2xl bg-red-950/40 border border-red-500/40 backdrop-blur-md flex items-center justify-between gap-3 text-xs sm:text-sm text-red-200 animate-in fade-in-50 slide-in-from-top-2">
+            <div className="flex items-center gap-3 flex-1">
+              <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0" />
+              <span>{errorMessage}</span>
+            </div>
+            {/* 크레딧 부족 시 노출되는 결제 유도 바로가기 버튼 */}
+            {isCreditInsufficient && (
+              <button
+                type="button"
+                onClick={() => setIsPricingModalOpen(true)}
+                className="
+                  inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl
+                  bg-emerald-500 hover:bg-emerald-400 active:bg-emerald-600
+                  text-black font-bold text-xs transition cursor-pointer shrink-0
+                "
+              >
+                <CreditCard className="w-3.5 h-3.5" />
+                <span>크레딧 충전하기</span>
+              </button>
+            )}
           </div>
         )}
 
@@ -502,6 +599,18 @@ export default function DashboardPage() {
       <footer className="w-full py-6 text-center text-xs text-gray-600 border-t border-white/[0.04] z-10">
         <p>© 2026 NailArt-AI. 모든 썸네일 생성 및 저작권은 크리에이터에게 귀속됩니다.</p>
       </footer>
+
+      {/* ── 9. 크레딧 부족 시 자동 팝업되는 요금제(Pricing) 모달 ── */}
+      <PricingModal
+        isOpen={isPricingModalOpen}
+        onClose={() => {
+          setIsPricingModalOpen(false);
+          // 모달 닫힐 때 최신 크레딧 동기화
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new Event('credit-updated'));
+          }
+        }}
+      />
     </div>
   );
 }
